@@ -1,20 +1,31 @@
-# issue-to-brief
+<div align="center">
 
-A Claude Code skill that turns a GitHub issue into a compact, agent-ready task
-brief before any code is written: acceptance criteria, files to touch, the
-test command, and per-step model-tier hints. The agent reads one short brief
-instead of exploring the repo, so it spends fewer tokens.
+# 📋 issue-to-brief
 
-It is built to work with two sibling tools:
+**Turn a GitHub issue into a compact, agent-ready task brief before any code is written.**
 
-- **quota-pilot** reads the tier hints (`tier-hint: haiku|sonnet|opus` lines in
-  the Markdown, or `steps[].tier_hint` in the JSON) to route each step to the
-  cheapest model that can do it.
-- **subagent-verify** reads `.claude/briefs/current.json` (`files.likely`,
-  `files.must_not_touch`, `acceptance_criteria`) to check that a subagent's
-  claimed changes really happened and stayed in scope.
+[![test](https://github.com/shadow-lo/issue-to-brief/actions/workflows/test.yml/badge.svg)](https://github.com/shadow-lo/issue-to-brief/actions/workflows/test.yml)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+![GitHub API](https://img.shields.io/badge/GitHub%20API-read--only-lightgrey)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-## Install
+[Türkçe](README.tr.md)
+
+</div>
+
+## ✨ Why
+
+An agent that gets a bare issue link starts by exploring the repo: it reads files, greps, guesses the test command, and spends a lot of tokens before writing a line. Worse, the issue text is written by strangers and can carry instructions or pasted secrets.
+
+`issue-to-brief` is a Claude Code skill that turns the issue into one short brief: **acceptance criteria, files to touch, the test command, and per-step model-tier hints**. The agent reads the brief instead of exploring. Issue text is treated as untrusted data throughout, secrets are redacted, and only HTTP GET is ever sent to GitHub.
+
+It works on its own, and pairs with two sibling tools:
+
+- **[quota-pilot](https://github.com/shadow-lo/quota-pilot)** reads the tier hints (`tier-hint: haiku|sonnet|opus` lines in the Markdown, or `steps[].tier_hint` in the JSON) to route each step to the cheapest model that can do it.
+- **[subagent-verify](https://github.com/shadow-lo/subagent-verify)** reads `.claude/briefs/current.json` (`files.likely`, `files.must_not_touch`, `acceptance_criteria`) to check that a subagent's claimed changes really happened and stayed in scope.
+
+## 📦 Install
 
 ```bash
 mkdir -p ~/.claude/skills
@@ -23,7 +34,7 @@ cp -r skill/issue-to-brief ~/.claude/skills/
 
 Requires Python 3.9+ (stdlib only, no dependencies). `gh` is optional.
 
-## Use
+## 🚀 Usage
 
 In Claude Code: "work on acme/demo#42" or "brief this issue: <url>". The skill
 runs, for example:
@@ -45,7 +56,7 @@ Output in the current repo: `.claude/briefs/issue-42.json`, `issue-42.md`,
 `validate <brief.json>`, `render <brief.json>`, `finalize <brief.json>` (after
 editing a brief by hand).
 
-## Security
+## 🛡️ Security rules
 
 | Risk | Defence |
 |---|---|
@@ -62,17 +73,17 @@ editing a brief by hand).
 `validate` re-checks all of this, so a brief that was edited by hand (or by a
 compromised step) can be rejected before another tool trusts it.
 
-## Tests
+## 🧪 Development
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m pytest -q          # or: python3 -m unittest discover -s tests -v
 ```
 
-## Format
+## 📝 Brief format
 
 See [docs/SCHEMA.md](docs/SCHEMA.md).
 
-## Known limitations
+## ⚠️ Limitations
 
 - Secret redaction is pattern-based. A bare high-entropy value with no
   recognizable prefix or `key=` label (for example a bare AWS secret access
@@ -86,3 +97,7 @@ See [docs/SCHEMA.md](docs/SCHEMA.md).
   CI or Claude config get no file hints for those paths.
 - Injection detection is advisory. The real defences are that issue text never
   becomes instructions, commands or parsed lines.
+
+## 📄 License
+
+[MIT](LICENSE)
