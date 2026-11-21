@@ -194,7 +194,8 @@ def sanitize_text(s: object, limit: int | None = None) -> str:
 # generic "sk-" prefix needs a start boundary to avoid eating normal words.
 _B = r"(?<![A-Za-z0-9])"
 _SECRET_WORDS = (r"api[_-]?key|apikey|secret|token|pass(?:wor)?d|passwd|pass|pwd|access[_-]?key|"
-                 r"private[_-]?key|client[_-]?secret|auth|credentials?|session[_-]?key|signing[_-]?key")
+                 r"private[_-]?key|client[_-]?secret|auth|credentials?|session[_-]?key|signing[_-]?key|"
+                 r"passphrase|secrets")
 _SECRET_PATTERNS = [
     ("private_key", re.compile(
         r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----.*?"
@@ -219,10 +220,10 @@ _SECRET_PATTERNS = [
     ("azure_key", re.compile(r"(?i)\b(?:AccountKey|SharedAccessKey|SharedAccessSignature|sig)=[^;\s&\"']{8,}")),
     ("url_credentials", re.compile(r"(?<=://)[^/\s:@]{1,256}:[^/\s@]{1,256}(?=@)")),
     ("assignment_quoted", re.compile(
-        r"(?i)((?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
+        r"(?i)(?:(?-i:(?<![A-Za-z]))|(?-i:(?<=[a-z])(?=[A-Z])))((?:" + _SECRET_WORDS + r")(?-i:(?![a-z]))[A-Za-z0-9_\-]{0,20})"
         r"([\"']?[ \t]*[:=][ \t]*)([\"'])([^\"'\n]{4,300})\3")),
     ("assignment", re.compile(
-        r"(?i)((?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
+        r"(?i)(?:(?-i:(?<![A-Za-z]))|(?-i:(?<=[a-z])(?=[A-Z])))((?:" + _SECRET_WORDS + r")(?-i:(?![a-z]))[A-Za-z0-9_\-]{0,20})"
         r"([\"']?[ \t]*[:=][ \t]*)([^\s\"'`]{6,})")),
 ]
 
@@ -763,6 +764,30 @@ class Repo:
         self._files = out
         return out
 
+    def secret_files_under(self, rel_dir: str, limit: int = 50) -> list[str]:
+        """Secret-like files/dirs under rel_dir (never read, only listed)."""
+        base = self._abs(rel_dir)
+        out: list[str] = []
+        if base is None or not base.is_dir():
+            return out
+        seen = 0
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS
+                                 and not os.path.islink(os.path.join(dirpath, d)))
+            for name in list(dirnames) + sorted(filenames):
+                seen += 1
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, self.root).replace(os.sep, "/")
+                if name in dirnames:
+                    rel += "/"
+                if is_secret_file(rel) and safe_relpath(rel) == rel:
+                    out.append(rel)
+                    if name in dirnames:
+                        dirnames.remove(name)  # whole dir protected
+            if len(out) >= limit or seen >= MAX_SCAN_FILES:
+                break
+        return out[:limit]
+
     def find_by_basename(self, name: str) -> list[str]:
         base = name.rsplit("/", 1)[-1]
         return [f for f in self.files() if f.rsplit("/", 1)[-1] == base][:3]
@@ -1037,6 +1062,14 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
                 context.append(t)
     if secret_mentions:
         flags.add("secret_file_mention")
+    if repo.root is not None:
+        # A directory in context may hold secrets the issue never named:
+        # protect those too (listed only, never read; no symlinks followed).
+        for d in [c for c in context if c.endswith("/")]:
+            for hidden in repo.secret_files_under(d):
+                if hidden not in secret_mentions:
+                    secret_mentions.append(hidden)
+                    flags.add("secret_in_context_dir")
     flags = sorted(flags)
     must_not_touch = list(MUST_NOT_TOUCH) + [p for p in secret_mentions if p not in MUST_NOT_TOUCH][:MAX_PATHS]
     # Guard rails and secrets are never expected changes or context. Filter
@@ -1201,7 +1234,7 @@ def validate_brief(b: object) -> None:
     if not isinstance(unt, dict) or unt.get("notice") != UNTRUSTED_NOTICE:
         raise _err("untrusted.notice missing or altered")
     flags = unt.get("injection_flags")
-    known = {pid for pid, _ in _INJECTION_PATTERNS} | {"hidden_content", "secret_file_mention"}
+    known = {pid for pid, _ in _INJECTION_PATTERNS} | {"hidden_content", "secret_file_mention", "secret_in_context_dir"}
     if not isinstance(flags, list) or any(f not in known for f in flags):
         raise _err("untrusted.injection_flags invalid")
     if (not isinstance(unt.get("redactions"), int) or isinstance(unt.get("redactions"), bool)
