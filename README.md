@@ -41,21 +41,23 @@ python3 ~/.claude/skills/issue-to-brief/scripts/issue_to_brief.py generate acme/
 ```
 
 Output in the current repo: `.claude/briefs/issue-42.json`, `issue-42.md`,
-`current.json`. Other commands: `validate <brief.json>`, `render <brief.json>`.
+`current.json` (and a `.gitignore` so they are not committed). Other commands:
+`validate <brief.json>`, `render <brief.json>`, `finalize <brief.json>` (after
+editing a brief by hand).
 
 ## Security
 
 | Risk | Defence |
 |---|---|
 | Prompt injection in issue text | Text is sanitized (HTML comments, `<script>`, zero-width, bidi, Unicode tag characters, control chars removed), scanned for 10 injection pattern families plus hidden content, flagged in `untrusted.injection_flags`, and labelled as untrusted data in every brief. Raw text is piped straight to the script so the agent never reads it. Injection flags prevent a `haiku` tier. |
-| Smuggling into parsed lines | Tier reasons come from a fixed vocabulary. Issue lines that look like `tier-hint:` or `<!-- quota-pilot` are neutralized. Untrusted Markdown is escaped (no live links or images, so no exfiltration via image URLs) or fenced with a fence longer than any in the text. |
-| Secret leakage | GitHub/AWS/Anthropic/OpenAI/Google/Slack/Stripe/npm tokens, JWTs, private keys, URL credentials and `password=...` style assignments are redacted before anything is written. The token is read only from `GITHUB_TOKEN`/`GH_TOKEN` (never argv), format-checked, never logged, and scrubbed from errors. |
+| Smuggling into parsed lines | Tier reasons come from a fixed vocabulary (no parentheses, so the strict `tier-hint` line format always parses). Any `tier-hint` / `quota-pilot` token in issue text is neutralized anywhere in a line, and Unicode line separators (U+2028/2029/0085, VT, FF) are turned into real newlines first so they cannot fake a line. Untrusted inline text is rendered as code spans (no links, autolinks, images or HTML, so no exfiltration via image URLs); the summary is fenced with a fence longer than any in the text. |
+| Secret leakage | GitHub/GitLab/AWS/Anthropic/OpenAI/Google/Slack/Discord/Stripe/npm/PyPI/Hugging Face tokens, JWTs, Bearer/Basic headers, private keys (incl. PGP), URL credentials and `password=...` style assignments (quoted or not) are redacted on the raw text, again after sanitizing, and only then truncated, so a length cap can never leave half a token behind. `source.url` is rebuilt from the validated repo and number, never copied. Secrets files (`.env*`, `*.pem`, `id_rsa*`, `.npmrc`, credentials, tfstate, ...) are never put in a brief as files to read or change; a mention adds them to `must_not_touch`, sets `sensitive=true` and raises `secret_file_mention`. Repo scans skip them. The token is read only from `GITHUB_TOKEN`/`GH_TOKEN` (never argv), format-checked, never logged, and scrubbed from errors. |
 | Token sent elsewhere | Requests go only to `https://api.github.com`, redirects are refused (they could forward `Authorization`), and the response origin is re-checked. |
 | Write access to GitHub | Only HTTP GET is used. |
-| Shell injection | No `subprocess`, no shell, no `eval`. Issue refs are validated with strict regexes. The test command is a fixed argv picked from repo config files, never from the issue and never copied from a `package.json` script body. |
-| Path traversal / symlinks | All paths are checked to be repo-relative (no `/`, `..`, `\`, `:`, `~`, leading `-`). Repo scanning never follows symlinks. Output refuses symlinked directories and target files and writes atomically. |
-| Agent editing its own guard rails | `.git/`, `.github/workflows/`, `.claude/settings*.json` and `.claude/hooks/` are always in `must_not_touch` and can never be listed as expected changes. |
-| Resource exhaustion | Caps on response size, body length, criteria, paths, labels, files scanned and bytes read per file. |
+| Shell injection | No `subprocess`, no shell, no `eval`. Issue refs are validated with strict regexes. The test command is a fixed argv picked from repo config files, never from the issue and never copied from a `package.json` script body, and `validate` accepts only an allow-list of argv shapes (plus up to 5 existing test files for pytest). |
+| Path traversal / symlinks | All paths are checked to be repo-relative (no `/`, `..`, `\`, `:`, `~`, leading `-`). Repo scanning never follows symlinks. Output refuses symlinked directories and target files and writes atomically; `finalize` is the only supported way to rewrite a brief after editing. `validate`/`finalize` refuse symlinks and non-regular files and read with a size cap. |
+| Agent editing its own guard rails | `.git/`, `.github/`, `.claude/` (settings, hooks, agents, commands, skills and the briefs themselves), `CLAUDE.md`, `CLAUDE.local.md`, `.mcp.json`, `.husky/`, `.githooks/`, `.pre-commit-config.yaml` and `.gitmodules` are always in `must_not_touch`. They can never be expected changes or context, and `allowed_globs` never covers them (`validate` rejects a glob that could). |
+| Resource exhaustion / ReDoS | Caps on response size, body length, line length, criteria, paths, labels, files scanned, bytes per file and total bytes per scan (one pass for all symbols). Line-oriented regexes are linear; a test feeds known worst-case inputs at the size cap and requires each to finish in under 2 seconds. |
 
 `validate` re-checks all of this, so a brief that was edited by hand (or by a
 compromised step) can be rejected before another tool trusts it.

@@ -51,18 +51,44 @@ MAX_SCAN_FILES = 20000
 MAX_SCAN_FILE_BYTES = 256 * 1024
 MAX_SYMBOLS = 5
 MAX_SYMBOL_HITS = 8
+MAX_SCAN_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_BRIEF_BYTES = 512 * 1024
 HTTP_TIMEOUT = 15
 
 API_HOST = "api.github.com"
 
+# Guard rails: never expected changes, never inside allowed_globs. Covers git
+# internals, CI (workflows, composite actions), every Claude config surface
+# (settings, hooks, agents, commands, skills and the briefs themselves),
+# MCP config and local git hooks.
 MUST_NOT_TOUCH = [
     ".git/",
-    ".github/workflows/",
-    ".claude/settings.json",
-    ".claude/settings.local.json",
-    ".claude/hooks/",
+    ".github/",
+    ".claude/",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    ".mcp.json",
+    ".husky/",
+    ".githooks/",
+    ".pre-commit-config.yaml",
+    ".gitmodules",
 ]
+
+# Files that usually hold secrets. A brief never asks an agent to read or
+# change them, whatever the issue says.
+_SECRET_FILE_RE = re.compile(
+    r"(?i)(^|/)("
+    r"\.env(\.[^/]*)?|\.envrc|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|tfstate|tfvars|asc|gpg|ovpn)|"
+    r"id_(rsa|dsa|ecdsa|ed25519)[^/]*|\.npmrc|\.pypirc|\.netrc|_netrc|\.htpasswd|\.pgpass|"
+    r"\.dockercfg|\.git-credentials|credentials([._-][^/]*)?|secrets?([._-][^/]*)?|"
+    r"[^/]*service[-_]?account[^/]*\.json|\.aws/[^/]*|\.ssh/[^/]*|\.gnupg/[^/]*|\.docker/config\.json|"
+    r"\.kube/config|kubeconfig[^/]*"
+    r")$"
+)
+
+
+def is_secret_file(path: str) -> bool:
+    return bool(_SECRET_FILE_RE.search(path.rstrip("/")))
 
 TIERS = ("haiku", "sonnet", "opus")
 KINDS = ("explore", "implement", "test", "verify")
@@ -70,7 +96,7 @@ KINDS = ("explore", "implement", "test", "verify")
 # Fixed vocabulary: reasons are never copied from issue text.
 REASONS = {
     "explore": "read-only exploration",
-    "mechanical": "mechanical change (docs/format/rename/simple)",
+    "mechanical": "mechanical change: docs, format, rename",
     "normal": "normal feature/bugfix in known code",
     "sensitive": "security-sensitive change",
     "crosscut": "cross-cutting change across many files",
@@ -126,6 +152,10 @@ _INVISIBLE_RE = re.compile(
     "]"
 )
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# Unicode line breaks that many line splitters (Python str.splitlines, JS)
+# treat as newlines. They are turned into real newlines so neutralization of
+# parser-sensitive lines sees them.
+_LINE_SEP_RE = re.compile("[\u2028\u2029\x85\x0b\x0c\x1c-\x1e]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
 _HIDDEN_TAG_RE = re.compile(
     r"<(script|style|template|noscript)\b[^>]*>.*?(?:</\1\s*>|\Z)", re.S | re.I
@@ -138,14 +168,15 @@ def sanitize_text(s: object, limit: int | None = None) -> str:
         return ""
     if not isinstance(s, str):
         s = str(s)
-    s = s[: MAX_BODY_IN * 2]
+    s = s[:MAX_RESPONSE_BYTES]
     s = unicodedata.normalize("NFC", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _LINE_SEP_RE.sub("\n", s)
     s = _HTML_COMMENT_RE.sub("", s)
     s = _HIDDEN_TAG_RE.sub("", s)
     s = _INVISIBLE_RE.sub("", s)
     s = _CTRL_RE.sub("", s)
-    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = "\n".join(line.rstrip(" \t") for line in s.split("\n"))
     s = re.sub(r"\n{3,}", "\n\n", s).strip()
     if limit is not None and len(s) > limit:
         s = s[: max(0, limit - 1)].rstrip() + "…"
@@ -154,33 +185,54 @@ def sanitize_text(s: object, limit: int | None = None) -> str:
 
 # ------------------------------------------------------------- secrets ---
 
+# Distinctive prefixes are matched even when glued to other text (no word
+# boundary), so "xxghp_..." or "..._suffix" cannot hide a token. Only the
+# generic "sk-" prefix needs a start boundary to avoid eating normal words.
+_B = r"(?<![A-Za-z0-9])"
+_SECRET_WORDS = (r"api[_-]?key|apikey|secret|token|pass(?:wor)?d|passwd|pass|pwd|access[_-]?key|"
+                 r"private[_-]?key|client[_-]?secret|auth|credentials?|session[_-]?key|signing[_-]?key")
 _SECRET_PATTERNS = [
     ("private_key", re.compile(
-        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
-        re.S)),
-    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,255}\b")),
-    ("github_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,255}\b")),
-    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}")),
-    ("openai_key", re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{20,}")),
-    ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}\b")),
-    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
-    ("slack_token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}")),
+        r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----.*?"
+        r"(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----|\Z)", re.S)),
+    ("github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,255}")),
+    ("github_pat", re.compile(r"github_pat_[A-Za-z0-9_]{20,255}")),
+    ("gitlab_token", re.compile(r"gl(?:pat|dt|ptt|rt|cbt|imt|oas)-[A-Za-z0-9_\-]{20,}")),
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")),
+    ("openai_key", re.compile(_B + r"sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}")),
+    ("aws_access_key", re.compile(r"(?:AKIA|ASIA|AGPA|AIDA|AROA|ABIA|ACCA)[0-9A-Z]{16}")),
+    ("google_api_key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
+    ("slack_token", re.compile(r"xox[abposre]-[A-Za-z0-9-]{10,}")),
     ("slack_webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_\-]+")),
-    ("stripe_key", re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}\b")),
-    ("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")),
+    ("discord_webhook", re.compile(r"https://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/[A-Za-z0-9/_\-]+")),
+    ("stripe_key", re.compile(r"(?:[rs]k|pk)_(?:live|test)_[A-Za-z0-9]{16,}")),
+    ("npm_token", re.compile(r"npm_[A-Za-z0-9]{36}")),
+    ("pypi_token", re.compile(r"pypi-[A-Za-z0-9_\-]{40,}")),
+    ("huggingface_token", re.compile(r"hf_[A-Za-z0-9]{30,}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")),
+    ("bearer", re.compile(r"(?i)\b(?:bearer|basic)[ \t]+[A-Za-z0-9._~+/\-]{16,}=*")),
     ("url_credentials", re.compile(r"(?<=://)[^/\s:@]{1,256}:[^/\s@]{1,256}(?=@)")),
+    ("assignment_quoted", re.compile(
+        r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_\-]{0,30}?(?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
+        r"([\"']?[ \t]*[:=][ \t]*)([\"'])([^\"'\n]{4,300})\3")),
     ("assignment", re.compile(
-        r"(?i)\b((?:api[_-]?key|secret|token|passw(?:or)?d|pwd|access[_-]?key|"
-        r"client[_-]?secret|auth)[A-Za-z0-9_\-]{0,20})(\s*[:=]\s*[\"']?)"
-        r"([^\s\"'`]{8,})")),
+        r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_\-]{0,30}?(?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
+        r"([\"']?[ \t]*[:=][ \t]*)([^\s\"'`]{8,})")),
 ]
 
 
 def redact_secrets(s: str) -> tuple[str, int]:
     count = 0
     for kind, rx in _SECRET_PATTERNS:
-        if kind == "assignment":
+        if kind == "assignment_quoted":
+            def _subq(m: re.Match) -> str:
+                nonlocal count
+                if m.group(4).startswith("[REDACTED"):
+                    return m.group(0)
+                count += 1
+                return f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED:secret]{m.group(3)}"
+            s = rx.sub(_subq, s)
+        elif kind == "assignment":
             def _sub(m: re.Match) -> str:
                 nonlocal count
                 if m.group(3).startswith("[REDACTED"):
@@ -197,7 +249,7 @@ def redact_secrets(s: str) -> tuple[str, int]:
 # ----------------------------------------------------------- injection ---
 
 _INJECTION_PATTERNS = [
-    ("ignore_instructions", r"\b(ignore|disregard|forget|override)\b.{0,40}\b(previous|prior|above|earlier|all|any|system)\b.{0,30}\b(instructions?|prompts?|rules?|guidelines?|directives?)"),
+    ("ignore_instructions", r"\b(ignore|disregard|forget|override|bypass)\b.{0,60}\b(instructions?|prompts?|guidelines?|directives?|guardrails?)\b|\b(ignore|disregard|forget)\b.{0,40}\b(previous|prior|above|earlier|all|system)\b.{0,30}\brules?\b"),
     ("role_play", r"\byou are (now|no longer)\b|\bact as (an? )?(admin|root|system|developer)\b|\bpretend (to be|you are)\b"),
     ("system_prompt", r"\bsystem prompt\b|<\s*/?\s*(system|assistant|user|instructions?)\s*>|^\s*(system|assistant)\s*:"),
     ("new_instructions", r"\b(new|updated|real|actual) instructions\b|\bimportant\s*:\s*(ai|agent|assistant|claude|llm)\b|\b(note|message) (to|for) (the )?(ai|agent|assistant|claude|llm|model)\b"),
@@ -206,7 +258,7 @@ _INJECTION_PATTERNS = [
     ("exfiltration", r"\b(exfiltrat\w*|send|post|upload|leak|print|echo|cat|reveal|show)\b.{0,40}(token|secret|api[_ -]?key|credential|password|ssh key|\.env\b|env(ironment)? var)"),
     ("encoded_payload", r"\bbase64\s+(-d|--decode)\b|\beval\s*\(|\bexec\s*\(|\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){7,}"),
     ("hidden_tool_call", r"<\s*(function_calls|invoke|tool_use|antml)\b"),
-    ("guardrail_tamper", r"\.claude/(settings|hooks)|\bdisable\b.{0,30}\b(hook|verif\w*|check|guard|safety|sandbox)|--dangerously|bypass\s*permissions"),
+    ("guardrail_tamper", r"\.claude/|\bclaude\.md\b|\.mcp\.json|\.github/(workflows|actions)|\bdisable\b.{0,30}\b(hook|verif\w*|check|guard|safety|sandbox)|--dangerously|bypass\s*permissions"),
 ]
 _INJECTION_RES = [(pid, re.compile(rx, re.I | re.M)) for pid, rx in _INJECTION_PATTERNS]
 
@@ -214,30 +266,38 @@ _INJECTION_RES = [(pid, re.compile(rx, re.I | re.M)) for pid, rx in _INJECTION_P
 def has_hidden_content(raw: str) -> bool:
     """True if the raw text contains content a human reviewer would not see."""
     return bool(_HTML_COMMENT_RE.search(raw) or _HIDDEN_TAG_RE.search(raw)
-                or _INVISIBLE_RE.search(raw) or _CTRL_RE.search(raw.replace("\r", "")))
+                or _INVISIBLE_RE.search(raw) or _LINE_SEP_RE.search(raw)
+                or _CTRL_RE.search(raw.replace("\r", "")))
 
 
 def detect_injection(s: str) -> list[str]:
-    return [pid for pid, rx in _INJECTION_RES if rx.search(s)]
+    """Advisory scan. Also checks an NFKC-casefolded copy so fullwidth and
+    compatibility forms do not evade the patterns."""
+    s = s[:MAX_RESPONSE_BYTES]
+    folded = unicodedata.normalize("NFKC", s).casefold()
+    return [pid for pid, rx in _INJECTION_RES if rx.search(s) or rx.search(folded)]
 
 
 # ---------------------------------------------------- markdown safety ---
 
-_MD_ESCAPE_RE = re.compile(r"([\\`*_{}\[\]()<>#+!|~^])")
-_PARSER_LINE_RE = re.compile(r"(?im)^(\s*)(tier-hint\s*:|<!--\s*quota-pilot|quota-pilot\s*:)")
-
-
-def md_inline(s: str) -> str:
-    """Escape untrusted text for inline Markdown so it cannot form links,
-    images (exfiltration via image URLs), HTML or headings."""
-    s = s.replace("\n", " ")
-    s = _PARSER_LINE_RE.sub(r"\1[neutralized] \2", s)
-    return _MD_ESCAPE_RE.sub(r"\\\1", s)
+_PARSER_TOKEN_RE = re.compile(r"(?i)tier[\s_-]*hint|quota[\s_-]*pilot")
 
 
 def neutralize_parser_lines(s: str) -> str:
-    """Stop issue text from producing lines that tier-hint parsers match."""
-    return _PARSER_LINE_RE.sub(r"\1[neutralized] \2", s)
+    """Stop issue text from producing anything a tier-hint parser matches,
+    anywhere in a line (not only at line start)."""
+    return _PARSER_TOKEN_RE.sub(lambda m: "[neutralized parser token]", s)
+
+
+def md_inline(s: str) -> str:
+    """Render untrusted text as an inline code span: no links, autolinks,
+    images (exfiltration via image URLs), HTML, emphasis or headings."""
+    s = neutralize_parser_lines(s.replace("\n", " ").replace("\r", " "))
+    if not s:
+        return "``"
+    longest = max([len(m) for m in re.findall(r"`+", s)] + [0])
+    fence = "`" * (longest + 1)
+    return f"{fence} {s} {fence}"
 
 
 def md_fence(s: str) -> str:
@@ -390,11 +450,16 @@ def normalize_issue(data: dict) -> dict:
     """Accept REST API, `gh issue view --json`, or GitHub MCP issue shapes."""
     labels_raw = data.get("labels") or []
     labels: list[str] = []
+    label_red = 0
     if isinstance(labels_raw, list):
         for lab in labels_raw[: MAX_LABELS * 2]:
             name = lab.get("name") if isinstance(lab, dict) else lab
             if isinstance(name, str):
-                clean = sanitize_text(name, MAX_LABEL_LEN)
+                # redact before any truncation so a cut can't split a secret
+                first, n1 = redact_secrets(name[:1000])
+                clean, n2 = redact_secrets(sanitize_text(first))
+                label_red += n1 + n2
+                clean = clean[:MAX_LABEL_LEN]
                 if clean:
                     labels.append(clean)
     number = data.get("number")
@@ -403,25 +468,50 @@ def normalize_issue(data: dict) -> dict:
             number = int(str(number))
         except (TypeError, ValueError):
             number = None
+    if number is not None and not (1 <= number <= 999_999_999):
+        number = None
+    # Only a canonical issue URL is kept; repo/number are parsed out of it so
+    # the CLI can cross-check them. Nothing else from the payload's URL fields
+    # is ever copied.
+    url_repo = None
+    url_num = None
     url = data.get("html_url") or data.get("url") or ""
-    if not isinstance(url, str) or not re.match(r"^https://github\.com/[A-Za-z0-9._/-]{1,250}$", url):
-        url = ""
+    m = _CANON_URL_RE.match(url) if isinstance(url, str) else None
+    if m:
+        try:
+            url_repo = validate_repo(f"{m.group(1)}/{m.group(2)}")
+            url_num = int(m.group(3))
+        except BriefError:
+            url_repo = None
     title = data.get("title") if isinstance(data.get("title"), str) else ""
     body = data.get("body") if isinstance(data.get("body"), str) else ""
     return {
         "number": number,
-        "title_raw": title[:2000],
-        "body_raw": body[:MAX_BODY_IN],
+        "title_raw": title[:MAX_RESPONSE_BYTES],
+        "body_raw": body[:MAX_RESPONSE_BYTES],
         "labels": labels[:MAX_LABELS],
-        "url": url,
+        "url_repo": url_repo,
+        "url_number": url_num,
+        "label_redactions": label_red,
     }
+
+
+_CANON_URL_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/issues/([0-9]{1,9})$")
+
+
+def issue_url(repo: str, number: int) -> str:
+    return f"https://github.com/{validate_repo(repo)}/issues/{int(number)}"
 
 
 # ------------------------------------------------- criteria extraction ---
 
-_CHECKBOX_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[( |x|X)\]\s+(.+?)\s*$")
-_HEADING_RE = re.compile(r"^\s*(?:#{1,6}\s+(.+?)\s*#*\s*$|\*\*(.+?)\*\*:?\s*$|__(.+?)__:?\s*$)")
-_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
+# These run on stripped lines of bounded length (see MAX_LINE), and avoid
+# lazy-plus-trailing-whitespace shapes, so they are linear.
+MAX_LINE = 2000
+_CHECKBOX_RE = re.compile(r"^(?:[-*+]|\d{1,9}[.)])[ \t]+\[( |x|X)\][ \t]+(\S.*)$")
+_HEADING_RE = re.compile(r"^(?:#{1,6}[ \t]+(\S.*)|\*\*([^*]+)\*\*:?|__([^_]+)__:?)$")
+_BULLET_RE = re.compile(r"^(?:[-*+]|\d{1,9}[.)])[ \t]+(\S.*)$")
 _AC_SECTION_RE = re.compile(
     r"(?i)\b(acceptance criteria|acceptance|expected (behaviou?r|result|outcome)|definition of done|"
     r"requirements?|success criteria|done when|kabul kriterleri|beklenen (davranış|sonuç))\b"
@@ -445,11 +535,13 @@ def extract_criteria(body: str) -> list[dict]:
     in_section = False
     section_bullets = 0
     in_code = False
-    for line in lines:
-        if re.match(r"^\s*(```|~~~)", line):
+    for raw_line in lines:
+        indented = raw_line.startswith((" ", "\t"))
+        line = raw_line.strip()
+        if line.startswith(("```", "~~~")):
             in_code = not in_code
             continue
-        if in_code:
+        if in_code or len(line) > MAX_LINE:
             continue
         m = _CHECKBOX_RE.match(line)
         if m:
@@ -457,7 +549,7 @@ def extract_criteria(body: str) -> list[dict]:
             continue
         h = _HEADING_RE.match(line)
         if h:
-            heading = next(g for g in h.groups() if g)
+            heading = next(g for g in h.groups() if g).rstrip("# \t")
             in_section = bool(_AC_SECTION_RE.search(heading))
             section_bullets = 0
             continue
@@ -466,13 +558,13 @@ def extract_criteria(body: str) -> list[dict]:
             if b:
                 add(b.group(1), "section")
                 section_bullets += 1
-            elif line.strip() and not line.startswith((" ", "\t")):
+            elif line and not indented:
                 if section_bullets:
                     # prose after the list ends the section
                     in_section = False
-                elif len(line.strip()) <= MAX_CRITERION_LEN:
+                elif len(line) <= MAX_CRITERION_LEN:
                     # a one-line prose criterion directly under the heading
-                    add(line.strip(), "section")
+                    add(line, "section")
                     in_section = False
     return out
 
@@ -481,7 +573,7 @@ def extract_criteria(body: str) -> list[dict]:
 
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._@+\-][A-Za-z0-9._@+\-/]*$")
 _PATH_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_/.:@-])((?:[A-Za-z0-9_@+\-.]+/)*[A-Za-z0-9_@+\-]+\.[A-Za-z0-9]{1,8}|"
+    r"(?<![A-Za-z0-9_/.:@+-])((?:[A-Za-z0-9_@+\-.]+/)*[A-Za-z0-9_@+\-]+\.[A-Za-z0-9]{1,8}|"
     r"(?:[A-Za-z0-9_@+\-.]+/)+[A-Za-z0-9_@+\-.]+/?)(?![A-Za-z0-9_/-])"
 )
 _BACKTICK_RE = re.compile(r"`([^`\n]{1,200})`")
@@ -518,18 +610,22 @@ def _looks_like_url_or_domain(tok: str, line: str) -> bool:
     return bool(re.fullmatch(r"(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|co|app)", first, re.I))
 
 
-def extract_mentions(body: str, title: str) -> tuple[list[tuple[str, bool]], list[str]]:
-    """Return ([(path, create_hint)], [symbols]) mentioned in the issue."""
-    paths: dict[str, bool] = {}
+def extract_mentions(body: str, title: str) -> tuple[list[tuple[str, bool, bool]], list[str]]:
+    """Return ([(path, create_hint, quoted)], [symbols]) mentioned in the issue.
+    quoted = the path appeared in backticks (a stronger signal)."""
+    paths: dict[str, list[bool]] = {}
     symbols: list[str] = []
     text = f"{title}\n{body}"
     for line in text.split("\n"):
+        line = line[:MAX_LINE]
         create = bool(_CREATE_HINT_RE.search(line))
         candidates: list[str] = []
+        quoted: set[str] = set()
         for bt in _BACKTICK_RE.findall(line):
             bt = bt.strip()
             if "/" in bt or re.search(r"\.[A-Za-z0-9]{1,8}$", bt):
                 candidates.append(bt)
+                quoted.add(bt)
             elif _SYMBOL_RE.match(bt) and len(symbols) < MAX_SYMBOLS:
                 sym = bt.rstrip("()")
                 if sym not in symbols:
@@ -544,10 +640,10 @@ def extract_mentions(body: str, title: str) -> tuple[list[tuple[str, bool]], lis
             if sp not in paths:
                 if len(paths) >= MAX_PATHS:
                     break
-                paths[sp] = create
+                paths[sp] = [create, c in quoted]
             else:
-                paths[sp] = paths[sp] or create
-    return list(paths.items()), symbols
+                paths[sp] = [paths[sp][0] or create, paths[sp][1] or c in quoted]
+    return [(p, v[0], v[1]) for p, v in paths.items()], symbols
 
 
 # =================================================== repository scan ====
@@ -627,7 +723,7 @@ class Repo:
                     if os.path.islink(full):
                         continue
                     rel = os.path.relpath(full, self.root).replace(os.sep, "/")
-                    if safe_relpath(rel):
+                    if safe_relpath(rel) and not is_secret_file(rel):
                         out.append(rel)
                     if len(out) >= MAX_SCAN_FILES:
                         break
@@ -640,20 +736,31 @@ class Repo:
         base = name.rsplit("/", 1)[-1]
         return [f for f in self.files() if f.rsplit("/", 1)[-1] == base][:3]
 
-    def grep_symbol(self, symbol: str) -> list[str]:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{2,60}", symbol):
-            return []
-        rx = re.compile(r"\b" + re.escape(symbol) + r"\b")
-        hits: list[str] = []
+    def grep_symbols(self, symbols: list[str]) -> dict[str, list[str]]:
+        """One pass over the repo for all symbols, with a total byte budget.
+        Secret-like files and guard-rail paths are never read."""
+        syms = [s for s in symbols if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{2,60}", s)][:MAX_SYMBOLS]
+        hits: dict[str, list[str]] = {s: [] for s in syms}
+        if not syms:
+            return hits
+        rxs = {s: re.compile(r"\b" + re.escape(s) + r"\b") for s in syms}
+        budget = MAX_SCAN_TOTAL_BYTES
         for f in self.files():
-            if PurePosixPath(f).suffix.lower() not in TEXT_EXT:
+            if budget <= 0 or all(len(v) >= MAX_SYMBOL_HITS for v in hits.values()):
+                break
+            if PurePosixPath(f).suffix.lower() not in TEXT_EXT or _under_any(f, MUST_NOT_TOUCH):
                 continue
             txt = self.read_text(f)
-            if txt and rx.search(txt):
-                hits.append(f)
-                if len(hits) >= MAX_SYMBOL_HITS:
-                    break
+            if not txt:
+                continue
+            budget -= len(txt)
+            for s_, rx in rxs.items():
+                if len(hits[s_]) < MAX_SYMBOL_HITS and rx.search(txt):
+                    hits[s_].append(f)
         return hits
+
+    def grep_symbol(self, symbol: str) -> list[str]:
+        return self.grep_symbols([symbol]).get(symbol, [])
 
 
 # ------------------------------------------------ test command detection
@@ -686,7 +793,7 @@ def detect_test_command(repo: Repo) -> dict | None:
         src = "pyproject.toml" if "[tool.pytest" in pyproject else (
             "pytest.ini" if repo.is_file("pytest.ini") else (
                 "setup.cfg" if "[tool:pytest]" in setup_cfg else "conftest.py"))
-        return {"argv": ["python", "-m", "pytest", "-q"], "source": src, "cwd": "."}
+        return {"argv": ["python3", "-m", "pytest", "-q"], "source": src, "cwd": "."}
     if repo.is_file("Cargo.toml"):
         return {"argv": ["cargo", "test"], "source": "Cargo.toml", "cwd": "."}
     if repo.is_file("go.mod"):
@@ -701,7 +808,8 @@ def detect_test_command(repo: Repo) -> dict | None:
             f.startswith(d + "/") and re.search(r"(^|/)test_[^/]+\.py$|_test\.py$", f)
             for f in repo.files()
         ):
-            return {"argv": ["python", "-m", "pytest", "-q"], "source": f"{d}/", "cwd": "."}
+            # no pytest config: use the stdlib runner, which needs no install
+            return {"argv": ["python3", "-m", "unittest", "discover", "-s", d], "source": f"{d}/", "cwd": "."}
     return None
 
 
@@ -778,8 +886,12 @@ def _globs_for(paths: list[str], repo: Repo) -> list[str]:
     globs: list[str] = []
     for p in paths:
         p = p.rstrip("/")
+        if _under_any(p, MUST_NOT_TOUCH) or is_secret_file(p):
+            continue
         parts = p.split("/")
         g = p if len(parts) == 1 else parts[0] + "/**"
+        if glob_overlaps_guard(g, MUST_NOT_TOUCH):
+            g = p  # never widen into a guard-rail directory
         if g not in globs:
             globs.append(g)
     for d in ("tests", "test", "__tests__", "spec"):
@@ -788,33 +900,56 @@ def _globs_for(paths: list[str], repo: Repo) -> list[str]:
     return globs
 
 
+def glob_overlaps_guard(glob: str, guards: list[str]) -> bool:
+    """True if a glob could match a guard-rail path (conservative)."""
+    prefix = re.split(r"[*?\[]", glob, maxsplit=1)[0]
+    has_wild = prefix != glob
+    for g in guards:
+        if _under_any(prefix.rstrip("/"), [g]) or (has_wild and g.startswith(prefix)):
+            return True
+        if not has_wild and prefix == g.rstrip("/"):
+            return True
+    return False
+
+
+_TEST_FILE_RE = re.compile(r"(^|/)(test_[^/]+|[^/]+_test|[^/]+\.(test|spec))\.[a-z]+$")
+
+
 def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
                 now: datetime | None = None) -> dict:
     issue = normalize_issue(raw_issue)
     if repo_name:
         repo_name = validate_repo(repo_name)
+    elif issue["url_repo"]:
+        repo_name = issue["url_repo"]
+    if repo_name and issue["url_repo"] and repo_name.lower() != issue["url_repo"].lower():
+        raise BriefError("issue payload URL is for a different repository than --repo")
+    if issue["number"] and issue["url_number"] and issue["number"] != issue["url_number"]:
+        raise BriefError("issue payload number and URL disagree")
+    if not issue["number"] and issue["url_number"]:
+        issue["number"] = issue["url_number"]
     content_sha = hashlib.sha256(
         (issue["title_raw"] + "\n\x00\n" + issue["body_raw"]).encode("utf-8", "replace")
     ).hexdigest()
 
-    title = sanitize_text(issue["title_raw"])
-    body = sanitize_text(issue["body_raw"], MAX_BODY_IN)
     raw_all = issue["title_raw"] + "\n" + issue["body_raw"]
     # Scan both the raw text (hidden comments etc.) and the sanitized text
     # (where zero-width characters no longer split keywords).
-    flags = set(detect_injection(raw_all) + detect_injection(title) + detect_injection(body))
+    flags = set(detect_injection(raw_all))
     if has_hidden_content(raw_all):
         flags.add("hidden_content")
-    flags = sorted(flags)
-    title, r1 = redact_secrets(title)
-    body, r2 = redact_secrets(body)
-    labels = []
-    r3 = 0
-    for lab in issue["labels"]:
-        lab, n = redact_secrets(lab)
-        r3 += n
-        labels.append(lab)
+    # Redact on the raw text, sanitize, redact again (zero-width characters
+    # may have split a token), and only then truncate, so a cut can never
+    # leave part of a secret behind.
+    title, r1 = redact_secrets(issue["title_raw"])
+    body, r2 = redact_secrets(issue["body_raw"])
+    title, r1b = redact_secrets(sanitize_text(title))
+    body, r2b = redact_secrets(sanitize_text(body))
+    flags.update(detect_injection(title) + detect_injection(body))
+    body = body[:MAX_BODY_IN]
+    labels = list(issue["labels"])  # already redacted in normalize_issue
     title = re.sub(r"\s+", " ", title)[:MAX_TITLE]
+    redactions = r1 + r2 + r1b + r2b
 
     criteria = extract_criteria(body)
     mentions, symbols = extract_mentions(body, title)
@@ -823,14 +958,23 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
     create: list[str] = []
     context: list[str] = []
     missing: list[str] = []
-    for path, create_hint in mentions:
+    secret_mentions: list[str] = []
+    for path, create_hint, quoted in mentions:
+        if is_secret_file(path):
+            # Never ask an agent to open a secrets file; protect it instead.
+            if path not in secret_mentions:
+                secret_mentions.append(path)
+            continue
+        if _under_any(path.rstrip("/"), MUST_NOT_TOUCH):
+            continue
         if path.endswith("/"):
             if repo.is_dir(path) and path not in context:
                 context.append(path)
             continue
         if repo.root is None:
             # No local checkout: everything is unverified.
-            missing.append(path)
+            if "/" in path or quoted:
+                missing.append(path)
         elif repo.is_file(path):
             if path not in modify:
                 modify.append(path)
@@ -842,33 +986,43 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
                 create.append(path)
         else:
             found = repo.find_by_basename(path) if "/" not in path else []
-            if len(found) == 1 and found[0] not in modify:
+            if len(found) == 1 and found[0] not in modify and not _under_any(found[0], MUST_NOT_TOUCH):
                 modify.append(found[0])
-            else:
+            elif "/" in path or quoted:
+                # bare words like "Node.js" or "e.g" are not worth reporting
                 missing.append(path)
     if repo.root is not None:
-        for sym in symbols:
-            for hit in repo.grep_symbol(sym):
+        for hits in repo.grep_symbols(symbols).values():
+            for hit in hits:
                 if hit not in modify and hit not in context:
                     context.append(hit)
         for t in related_tests(repo, modify):
             if t not in context:
                 context.append(t)
-    # Guard rails are never "expected changes".
-    modify = [p for p in modify if not _under_any(p, MUST_NOT_TOUCH)][:MAX_PATHS]
-    create = [p for p in create if not _under_any(p, MUST_NOT_TOUCH)][:MAX_PATHS]
-    context = context[:MAX_PATHS]
+    if secret_mentions:
+        flags.add("secret_file_mention")
+    flags = sorted(flags)
+    # Guard rails and secrets are never expected changes or context.
+    def _ok(p: str) -> bool:
+        return not _under_any(p.rstrip("/"), MUST_NOT_TOUCH) and not is_secret_file(p)
+    modify = [p for p in modify if _ok(p)][:MAX_PATHS]
+    create = [p for p in create if _ok(p)][:MAX_PATHS]
+    context = [p for p in context if _ok(p)][:MAX_PATHS]
     missing = missing[:MAX_PATHS]
     likely = modify + [c for c in create if c not in modify]
+    must_not_touch = list(MUST_NOT_TOUCH) + [p for p in secret_mentions if p not in MUST_NOT_TOUCH][:MAX_PATHS]
 
     tiers = decide_tiers(title, body, labels, likely, len(criteria), flags)
+    if secret_mentions:
+        tiers["sensitive"] = True
     impl_tier, impl_reason = tiers["implement"]
     test_tier, test_reason = tiers["test"]
     test_cmd = detect_test_command(repo)
-    targeted = [t for t in likely + context if re.search(r"(^|/)(test_[^/]+|[^/]+_test|[^/]+\.(test|spec))\.[a-z]+$", t)]
-    if test_cmd and targeted and test_cmd["argv"][:3] == ["python", "-m", "pytest"]:
+    targeted = [t for t in likely + context if _TEST_FILE_RE.search(t)]
+    existing_tests = [t for t in targeted if repo.is_file(t)]
+    if test_cmd and existing_tests and test_cmd["argv"][:3] == ["python3", "-m", "pytest"]:
         test_cmd = dict(test_cmd)
-        test_cmd["targeted_argv"] = test_cmd["argv"] + [t for t in targeted if t.endswith(".py")][:5]
+        test_cmd["targeted_argv"] = test_cmd["argv"] + [t for t in existing_tests if t.endswith(".py")][:5]
 
     ac_ids = [c["id"] for c in criteria if not c["done"]]
     steps = [
@@ -896,7 +1050,7 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
         "source": {
             "repo": repo_name or "",
             "issue": issue["number"] if isinstance(issue["number"], int) else 0,
-            "url": issue["url"],
+            "url": issue_url(repo_name, issue["number"]) if repo_name and issue["number"] else "",
             "fetched_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "content_sha256": content_sha,
         },
@@ -906,7 +1060,7 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
         "untrusted": {
             "notice": UNTRUSTED_NOTICE,
             "injection_flags": flags,
-            "redactions": r1 + r2 + r3,
+            "redactions": redactions + issue.get("label_redactions", 0),
         },
         "acceptance_criteria": criteria,
         "files": {
@@ -915,7 +1069,7 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
             "delete": [],
             "context": context,
             "likely": likely,
-            "must_not_touch": list(MUST_NOT_TOUCH),
+            "must_not_touch": must_not_touch,
             "allowed_globs": _globs_for(likely + [c for c in context if not c.endswith("/")], repo)
             if likely or context else [],
             "mentioned_missing": missing,
@@ -949,8 +1103,8 @@ def _check_str(v: object, name: str, maxlen: int) -> None:
         raise _err(f"{name} must be a string")
     if len(v) > maxlen:
         raise _err(f"{name} too long")
-    if _CTRL_RE.search(v) or _INVISIBLE_RE.search(v):
-        raise _err(f"{name} contains control or invisible characters")
+    if _CTRL_RE.search(v) or _INVISIBLE_RE.search(v) or _LINE_SEP_RE.search(v):
+        raise _err(f"{name} contains control, line-separator or invisible characters")
 
 
 def _check_paths(v: object, name: str, allow_dir: bool = True) -> None:
@@ -961,6 +1115,16 @@ def _check_paths(v: object, name: str, allow_dir: bool = True) -> None:
         if sp is None or sp != p or (not allow_dir and p.endswith("/")):
             raise _err(f"{name} contains an unsafe path")
 
+
+# The only commands a brief may carry. validate() rejects anything else, so
+# a hand-edited or tampered brief cannot smuggle in a shell command.
+ALLOWED_TEST_ARGV = {
+    ("npm", "test"), ("pnpm", "test"), ("yarn", "test"), ("bun", "run", "test"),
+    ("python3", "-m", "pytest", "-q"),
+    ("python3", "-m", "unittest", "discover", "-s", "tests"),
+    ("python3", "-m", "unittest", "discover", "-s", "test"),
+    ("cargo", "test"), ("go", "test", "./..."), ("make", "test"), ("tox",),
+}
 
 _GLOB_RE = re.compile(r"^[A-Za-z0-9._@+\-][A-Za-z0-9._@+\-/*]*$")
 
@@ -980,8 +1144,9 @@ def validate_brief(b: object) -> None:
     if not isinstance(src.get("issue"), int) or isinstance(src.get("issue"), bool) or src["issue"] < 0:
         raise _err("source.issue must be a non-negative integer")
     _check_str(src.get("url", ""), "source.url", 300)
-    if src.get("url") and not src["url"].startswith("https://github.com/"):
-        raise _err("source.url must be a github.com URL")
+    if src.get("url"):
+        if not src.get("repo") or src["url"] != issue_url(src["repo"], src["issue"]):
+            raise _err("source.url must be https://github.com/<repo>/issues/<issue>")
     if not re.fullmatch(r"[0-9a-f]{64}", str(src.get("content_sha256", ""))):
         raise _err("source.content_sha256 must be hex sha256")
     _check_str(b.get("title"), "title", MAX_TITLE)
@@ -995,11 +1160,12 @@ def validate_brief(b: object) -> None:
     if not isinstance(unt, dict) or unt.get("notice") != UNTRUSTED_NOTICE:
         raise _err("untrusted.notice missing or altered")
     flags = unt.get("injection_flags")
-    known = {pid for pid, _ in _INJECTION_PATTERNS} | {"hidden_content"}
+    known = {pid for pid, _ in _INJECTION_PATTERNS} | {"hidden_content", "secret_file_mention"}
     if not isinstance(flags, list) or any(f not in known for f in flags):
         raise _err("untrusted.injection_flags invalid")
-    if not isinstance(unt.get("redactions"), int) or isinstance(unt.get("redactions"), bool):
-        raise _err("untrusted.redactions must be an integer")
+    if (not isinstance(unt.get("redactions"), int) or isinstance(unt.get("redactions"), bool)
+            or unt["redactions"] < 0):
+        raise _err("untrusted.redactions must be a non-negative integer")
     acs = b.get("acceptance_criteria")
     if not isinstance(acs, list) or len(acs) > MAX_CRITERIA:
         raise _err("acceptance_criteria must be a list")
@@ -1023,31 +1189,39 @@ def validate_brief(b: object) -> None:
     for g in MUST_NOT_TOUCH:
         if g not in files["must_not_touch"]:
             raise _err("files.must_not_touch is missing a required guard-rail entry")
-    for key in ("modify", "create", "delete", "likely"):
+    for key in ("modify", "create", "delete", "likely", "context"):
         for p in files[key]:
-            if _under_any(p, files["must_not_touch"]):
-                raise _err(f"files.{key} overlaps must_not_touch")
+            if _under_any(p.rstrip("/"), files["must_not_touch"]) or is_secret_file(p):
+                raise _err(f"files.{key} overlaps must_not_touch or names a secrets file")
+    expected = files["modify"] + [c for c in files["create"] if c not in files["modify"]]
+    if files["likely"] != expected:
+        raise _err("files.likely must equal modify + create")
     globs = files.get("allowed_globs")
     if not isinstance(globs, list) or len(globs) > MAX_PATHS * 2:
         raise _err("files.allowed_globs must be a list")
     for g in globs:
         if not isinstance(g, str) or not _GLOB_RE.match(g) or ".." in g.split("/") or len(g) > MAX_PATH_LEN:
             raise _err("files.allowed_globs contains an unsafe glob")
+        if glob_overlaps_guard(g, files["must_not_touch"]) or is_secret_file(g):
+            raise _err("files.allowed_globs overlaps a must_not_touch entry")
     tc = b.get("test_command")
     if tc is not None:
         if not isinstance(tc, dict):
             raise _err("test_command must be an object or null")
-        for key in ("argv", "targeted_argv"):
-            if key not in tc:
-                continue
-            argv = tc[key]
-            if not isinstance(argv, list) or not argv or len(argv) > 16:
-                raise _err(f"test_command.{key} must be a non-empty list")
-            for a in argv:
-                if not isinstance(a, str) or not re.fullmatch(r"[A-Za-z0-9._/@+=:\-]{1,200}", a):
-                    raise _err(f"test_command.{key} has an unsafe argument")
-        if "argv" not in tc:
-            raise _err("test_command.argv required")
+        if set(tc) - {"argv", "targeted_argv", "source", "cwd"}:
+            raise _err("test_command has unknown keys")
+        argv = tc.get("argv")
+        if not isinstance(argv, list) or tuple(argv) not in ALLOWED_TEST_ARGV:
+            raise _err("test_command.argv is not one of the allowed test commands")
+        if "targeted_argv" in tc:
+            t = tc["targeted_argv"]
+            if (not isinstance(t, list) or tuple(argv) != ("python3", "-m", "pytest", "-q")
+                    or t[:4] != argv or not 1 <= len(t) - 4 <= 5):
+                raise _err("test_command.targeted_argv must be the pytest argv plus 1-5 test files")
+            for a in t[4:]:
+                if (safe_relpath(a) != a or a.endswith("/") or not _TEST_FILE_RE.search(a)
+                        or not a.endswith(".py") or _under_any(a, files["must_not_touch"])):
+                    raise _err("test_command.targeted_argv has an unsafe argument")
         _check_str(tc.get("source", ""), "test_command.source", 100)
         if tc.get("cwd", ".") != ".":
             raise _err("test_command.cwd must be '.'")
@@ -1188,9 +1362,14 @@ def _atomic_write(directory: Path, name: str, text: str) -> Path:
 
 def write_brief(b: dict, root: str, out_dir: str = ".claude/briefs", current: bool = True) -> list[Path]:
     validate_brief(b)
+    n = b["source"]["issue"]
+    if not n:
+        raise BriefError("the issue number is unknown; pass --number (or an issue ref) to write files")
     rootp = Path(root).resolve()
     d = _safe_out_dir(rootp, out_dir)
-    n = b["source"]["issue"]
+    # Briefs hold (sanitized) third-party text; keep them out of commits.
+    if not (d / ".gitignore").exists() and not (d / ".gitignore").is_symlink():
+        _atomic_write(d, ".gitignore", "*\n")
     js = json.dumps(b, indent=2, ensure_ascii=False) + "\n"
     md = render_markdown(b)
     written = [
@@ -1220,7 +1399,10 @@ def _cmd_generate(a: argparse.Namespace) -> int:
         raw = load_issue_file(a.issue_json)
     else:
         raw = load_issue_stdin()
-    if number and not raw.get("number"):
+    if number:
+        given = raw.get("number")
+        if given not in (None, "", 0) and str(given) != str(number):
+            raise BriefError("issue number in the JSON does not match the requested number")
         raw = dict(raw, number=number)
     repo = Repo(a.repo_root if not a.no_repo else None)
     brief = build_brief(raw, repo_name, repo)
@@ -1239,15 +1421,30 @@ def _cmd_generate(a: argparse.Namespace) -> int:
 
 
 def _load_brief(path: str) -> dict:
-    p = Path(path)
+    """Bounded read of a regular, non-symlink file (no /dev/zero, no FIFOs)."""
     try:
-        if p.stat().st_size > MAX_BRIEF_BYTES:
-            raise BriefError("brief file too large")
-        return json.loads(p.read_text(encoding="utf-8"))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError:
-        raise BriefError("cannot read brief file") from None
+        raise BriefError("cannot read brief file (missing, or a symlink)") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise BriefError("brief must be a regular file")
+        chunks, total = [], 0
+        while total <= MAX_BRIEF_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > MAX_BRIEF_BYTES:
+            raise BriefError("brief file too large")
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(b"".join(chunks).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise BriefError("brief file is not valid JSON") from None
+    return data
 
 
 def _cmd_validate(a: argparse.Namespace) -> int:
@@ -1258,6 +1455,18 @@ def _cmd_validate(a: argparse.Namespace) -> int:
 
 def _cmd_render(a: argparse.Namespace) -> int:
     sys.stdout.write(render_markdown(_load_brief(a.path)))
+    return 0
+
+
+def _cmd_finalize(a: argparse.Namespace) -> int:
+    """After hand-editing a brief JSON: validate it, then rewrite the JSON,
+    the Markdown and current.json with the same symlink-safe atomic writer."""
+    b = _load_brief(a.path)
+    validate_brief(b)
+    paths = write_brief(b, a.repo_root, a.out_dir, current=not a.no_current)
+    root = Path(a.repo_root).resolve()
+    for p in paths:
+        print(p.relative_to(root).as_posix())
     return 0
 
 
@@ -1287,11 +1496,21 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("render", help="render Markdown from a brief JSON file")
     r.add_argument("path")
     r.set_defaults(fn=_cmd_render)
+    fz = sub.add_parser("finalize", help="validate an edited brief JSON and rewrite .md and current.json")
+    fz.add_argument("path")
+    fz.add_argument("--repo-root", default=".", help="repository root (default .)")
+    fz.add_argument("--out-dir", default=".claude/briefs", help="repo-relative output dir")
+    fz.add_argument("--no-current", action="store_true", help="do not update current.json")
+    fz.set_defaults(fn=_cmd_finalize)
     a = ap.parse_args(argv)
     try:
         return a.fn(a)
     except BriefError as e:
         print(f"error: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        # strerror only: no paths or payload text in the message
+        print(f"error: filesystem error: {e.strerror or type(e).__name__}", file=sys.stderr)
         return 2
 
 
