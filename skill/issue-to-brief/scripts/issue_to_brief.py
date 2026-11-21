@@ -76,19 +76,23 @@ MUST_NOT_TOUCH = [
 
 # Files that usually hold secrets. A brief never asks an agent to read or
 # change them, whatever the issue says.
+_BAK = r"(?:\.(?:bak|old|orig|backup|save|swp|tmp|copy|\d+)|~)*"
 _SECRET_FILE_RE = re.compile(
-    r"(?i)(^|/)("
-    r"\.env(\.[^/]*)?|\.envrc|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|tfstate|tfvars|asc|gpg|ovpn)|"
-    r"id_(rsa|dsa|ecdsa|ed25519)[^/]*|\.npmrc|\.pypirc|\.netrc|_netrc|\.htpasswd|\.pgpass|"
-    r"\.dockercfg|\.git-credentials|credentials([._-][^/]*)?|secrets?([._-][^/]*)?|"
-    r"[^/]*service[-_]?account[^/]*\.json|\.aws/[^/]*|\.ssh/[^/]*|\.gnupg/[^/]*|\.docker/config\.json|"
-    r"\.kube/config|kubeconfig[^/]*"
-    r")$"
+    r"(?i)(?:^|/)(?:"
+    # any path *component* that is a secrets directory
+    r"(?:secrets?|credentials?|\.ssh|\.gnupg|\.aws|\.docker|\.kube|private|keys)(?:/|$)|"
+    # basenames
+    r"(?:\.env(?:\.[^/]*)?|[^/]*\.env|\.envrc|\.secrets?[^/]*|"
+    r"[^/]*\.(?:pem|key|p12|pfx|jks|keystore|kdbx|tfstate|tfvars|asc|gpg|ovpn|ppk)" + _BAK + r"|"
+    r"id_(?:rsa|dsa|ecdsa|ed25519)[^/]*|\.npmrc|\.pypirc|\.netrc|_netrc|\.htpasswd|\.pgpass|"
+    r"\.dockercfg|\.git-credentials|credentials(?:[._-][^/]*)?|secrets?(?:[._-][^/]*)?|"
+    r"[^/]*service[-_]?account[^/]*\.json|[^/]*token[^/]*\.txt|kubeconfig[^/]*|master\.key)$"
+    r")"
 )
 
 
 def is_secret_file(path: str) -> bool:
-    return bool(_SECRET_FILE_RE.search(path.rstrip("/")))
+    return bool(_SECRET_FILE_RE.search(path.rstrip("/") + ("/" if path.endswith("/") else "")))
 
 TIERS = ("haiku", "sonnet", "opus")
 KINDS = ("explore", "implement", "test", "verify")
@@ -158,7 +162,7 @@ _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _LINE_SEP_RE = re.compile("[\u2028\u2029\x85\x0b\x0c\x1c-\x1e]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
 _HIDDEN_TAG_RE = re.compile(
-    r"<(script|style|template|noscript)\b[^>]*>.*?(?:</\1\s*>|\Z)", re.S | re.I
+    r"<(script|style|template|noscript)\b[^>]{0,500}>.*?(?:</\1\s{0,20}>|\Z)", re.S | re.I
 )
 
 
@@ -211,13 +215,15 @@ _SECRET_PATTERNS = [
     ("huggingface_token", re.compile(r"hf_[A-Za-z0-9]{30,}")),
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")),
     ("bearer", re.compile(r"(?i)\b(?:bearer|basic)[ \t]+[A-Za-z0-9._~+/\-]{16,}=*")),
+    ("github_classic_auth", re.compile(r"(?i)\btoken[ \t]+[0-9a-f]{40}\b")),
+    ("azure_key", re.compile(r"(?i)\b(?:AccountKey|SharedAccessKey|SharedAccessSignature|sig)=[^;\s&\"']{8,}")),
     ("url_credentials", re.compile(r"(?<=://)[^/\s:@]{1,256}:[^/\s@]{1,256}(?=@)")),
     ("assignment_quoted", re.compile(
-        r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_\-]{0,30}?(?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
+        r"(?i)((?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
         r"([\"']?[ \t]*[:=][ \t]*)([\"'])([^\"'\n]{4,300})\3")),
     ("assignment", re.compile(
-        r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_\-]{0,30}?(?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
-        r"([\"']?[ \t]*[:=][ \t]*)([^\s\"'`]{8,})")),
+        r"(?i)((?:" + _SECRET_WORDS + r")[A-Za-z0-9_\-]{0,20})"
+        r"([\"']?[ \t]*[:=][ \t]*)([^\s\"'`]{6,})")),
 ]
 
 
@@ -448,13 +454,15 @@ def load_issue_stdin() -> dict:
 
 def normalize_issue(data: dict) -> dict:
     """Accept REST API, `gh issue view --json`, or GitHub MCP issue shapes."""
-    labels_raw = data.get("labels") or []
+    labels_in = data.get("labels") or []
     labels: list[str] = []
+    labels_raw: list[str] = []
     label_red = 0
-    if isinstance(labels_raw, list):
-        for lab in labels_raw[: MAX_LABELS * 2]:
+    if isinstance(labels_in, list):
+        for lab in labels_in[: MAX_LABELS * 2]:
             name = lab.get("name") if isinstance(lab, dict) else lab
             if isinstance(name, str):
+                labels_raw.append(name[:1000])
                 # redact before any truncation so a cut can't split a secret
                 first, n1 = redact_secrets(name[:1000])
                 clean, n2 = redact_secrets(sanitize_text(first))
@@ -487,17 +495,40 @@ def normalize_issue(data: dict) -> dict:
     body = data.get("body") if isinstance(data.get("body"), str) else ""
     return {
         "number": number,
-        "title_raw": title[:MAX_RESPONSE_BYTES],
-        "body_raw": body[:MAX_RESPONSE_BYTES],
+        "title_raw": _cap_raw(title, MAX_TITLE * 5),
+        "body_raw": _cap_raw(body, MAX_BODY_IN + 4096),
         "labels": labels[:MAX_LABELS],
         "url_repo": url_repo,
         "url_number": url_num,
         "label_redactions": label_red,
+        "labels_raw": labels_raw[:MAX_LABELS * 2],
     }
 
 
 _CANON_URL_RE = re.compile(
     r"^https://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/issues/([0-9]{1,9})$")
+
+
+def _cap_raw(s: str, limit: int) -> str:
+    """Bound raw text before any regex work. GitHub caps issue bodies at
+    65,536 characters, so nothing real is lost. The trailing partial line (or
+    word, if there is no newline) is dropped so the cut can never leave a
+    fragment of a secret behind: every pattern we redact stays within one
+    line, or (private keys) matches to end of text."""
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    nl = cut.rfind("\n")
+    if nl > limit // 2:
+        # drop the trailing partial line: quoted secret values never span lines
+        return cut[:nl]
+    if not s[limit].isspace():
+        # drop the trailing partial word (linear scan, no regex)
+        i = len(cut)
+        while i > 0 and not cut[i - 1].isspace():
+            i -= 1
+        cut = cut[:i]
+    return cut
 
 
 def issue_url(repo: str, number: int) -> str:
@@ -574,7 +605,7 @@ def extract_criteria(body: str) -> list[dict]:
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._@+\-][A-Za-z0-9._@+\-/]*$")
 _PATH_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_/.:@+-])((?:[A-Za-z0-9_@+\-.]+/)*[A-Za-z0-9_@+\-]+\.[A-Za-z0-9]{1,8}|"
-    r"(?:[A-Za-z0-9_@+\-.]+/)+[A-Za-z0-9_@+\-.]+/?)(?![A-Za-z0-9_/-])"
+    r"(?:[A-Za-z0-9_@+\-.]+/)+[A-Za-z0-9_@+\-.]+/?)(?![A-Za-z0-9_/-]|\.[A-Za-z0-9])"
 )
 _BACKTICK_RE = re.compile(r"`([^`\n]{1,200})`")
 _SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,60}(?:\(\))?$")
@@ -882,27 +913,31 @@ def decide_tiers(title: str, body: str, labels: list[str], likely: list[str],
     }
 
 
-def _globs_for(paths: list[str], repo: Repo) -> list[str]:
+def _globs_for(paths: list[str], repo: Repo, guards: list[str] | None = None) -> list[str]:
+    guards = guards if guards is not None else MUST_NOT_TOUCH
     globs: list[str] = []
     for p in paths:
         p = p.rstrip("/")
-        if _under_any(p, MUST_NOT_TOUCH) or is_secret_file(p):
+        if _under_any(p, guards) or is_secret_file(p):
             continue
         parts = p.split("/")
         g = p if len(parts) == 1 else parts[0] + "/**"
-        if glob_overlaps_guard(g, MUST_NOT_TOUCH):
+        if glob_overlaps_guard(g, guards):
             g = p  # never widen into a guard-rail directory
-        if g not in globs:
+        if g not in globs and not glob_overlaps_guard(g, guards):
             globs.append(g)
     for d in ("tests", "test", "__tests__", "spec"):
-        if repo.is_dir(d) and f"{d}/**" not in globs:
-            globs.append(f"{d}/**")
+        g = f"{d}/**"
+        if repo.is_dir(d) and g not in globs and not glob_overlaps_guard(g, guards):
+            globs.append(g)
     return globs
 
 
 def glob_overlaps_guard(glob: str, guards: list[str]) -> bool:
     """True if a glob could match a guard-rail path (conservative)."""
-    prefix = re.split(r"[*?\[]", glob, maxsplit=1)[0]
+    prefix = re.split(r"[*?\[]", glob, maxsplit=1)[0].casefold()
+    glob = glob.casefold()
+    guards = [g.casefold() for g in guards]
     has_wild = prefix != glob
     for g in guards:
         if _under_any(prefix.rstrip("/"), [g]) or (has_wild and g.startswith(prefix)):
@@ -923,7 +958,8 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
     elif issue["url_repo"]:
         repo_name = issue["url_repo"]
     if repo_name and issue["url_repo"] and repo_name.lower() != issue["url_repo"].lower():
-        raise BriefError("issue payload URL is for a different repository than --repo")
+        raise BriefError("issue payload URL is for a different repository than --repo "
+                         "(if the repository was renamed or transferred, pass its current name)")
     if issue["number"] and issue["url_number"] and issue["number"] != issue["url_number"]:
         raise BriefError("issue payload number and URL disagree")
     if not issue["number"] and issue["url_number"]:
@@ -932,7 +968,7 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
         (issue["title_raw"] + "\n\x00\n" + issue["body_raw"]).encode("utf-8", "replace")
     ).hexdigest()
 
-    raw_all = issue["title_raw"] + "\n" + issue["body_raw"]
+    raw_all = issue["title_raw"] + "\n" + issue["body_raw"] + "\n" + "\n".join(issue["labels_raw"])
     # Scan both the raw text (hidden comments etc.) and the sanitized text
     # (where zero-width characters no longer split keywords).
     flags = set(detect_injection(raw_all))
@@ -1002,15 +1038,16 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
     if secret_mentions:
         flags.add("secret_file_mention")
     flags = sorted(flags)
-    # Guard rails and secrets are never expected changes or context.
+    must_not_touch = list(MUST_NOT_TOUCH) + [p for p in secret_mentions if p not in MUST_NOT_TOUCH][:MAX_PATHS]
+    # Guard rails and secrets are never expected changes or context. Filter
+    # against the FULL list (constant guard rails + issue-named secrets).
     def _ok(p: str) -> bool:
-        return not _under_any(p.rstrip("/"), MUST_NOT_TOUCH) and not is_secret_file(p)
+        return not _under_any(p.rstrip("/"), must_not_touch) and not is_secret_file(p)
     modify = [p for p in modify if _ok(p)][:MAX_PATHS]
     create = [p for p in create if _ok(p)][:MAX_PATHS]
     context = [p for p in context if _ok(p)][:MAX_PATHS]
     missing = missing[:MAX_PATHS]
     likely = modify + [c for c in create if c not in modify]
-    must_not_touch = list(MUST_NOT_TOUCH) + [p for p in secret_mentions if p not in MUST_NOT_TOUCH][:MAX_PATHS]
 
     tiers = decide_tiers(title, body, labels, likely, len(criteria), flags)
     if secret_mentions:
@@ -1070,7 +1107,7 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
             "context": context,
             "likely": likely,
             "must_not_touch": must_not_touch,
-            "allowed_globs": _globs_for(likely + [c for c in context if not c.endswith("/")], repo)
+            "allowed_globs": _globs_for(likely + [c for c in context if not c.endswith("/")], repo, must_not_touch)
             if likely or context else [],
             "mentioned_missing": missing,
         },
@@ -1083,7 +1120,11 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
 
 
 def _under_any(path: str, prefixes: list[str]) -> bool:
+    """Prefix match, case-insensitive: on default macOS/Windows filesystems
+    `.Claude/settings.json` IS `.claude/settings.json`."""
+    path = path.casefold()
     for pre in prefixes:
+        pre = pre.casefold()
         if pre.endswith("/"):
             if path == pre.rstrip("/") or path.startswith(pre):
                 return True
@@ -1189,7 +1230,7 @@ def validate_brief(b: object) -> None:
     for g in MUST_NOT_TOUCH:
         if g not in files["must_not_touch"]:
             raise _err("files.must_not_touch is missing a required guard-rail entry")
-    for key in ("modify", "create", "delete", "likely", "context"):
+    for key in ("modify", "create", "delete", "likely", "context", "mentioned_missing"):
         for p in files[key]:
             if _under_any(p.rstrip("/"), files["must_not_touch"]) or is_secret_file(p):
                 raise _err(f"files.{key} overlaps must_not_touch or names a secrets file")
@@ -1244,6 +1285,10 @@ def validate_brief(b: object) -> None:
         if s.get("reason") not in REASONS.values():
             raise _err("step reason must come from the fixed vocabulary")
         _check_paths(s.get("files"), "step files")
+        allowed_step_files = set(files["likely"]) | set(files["context"])
+        for p in s["files"]:
+            if p not in allowed_step_files:
+                raise _err("step files must come from files.likely or files.context")
         acc = s.get("acceptance")
         if not isinstance(acc, list) or any(a not in ac_ids for a in acc):
             raise _err("step acceptance must reference existing criteria")

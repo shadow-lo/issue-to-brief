@@ -37,6 +37,8 @@ the tier hints that `quota-pilot` routes on.
    `files.must_not_touch` (`.env*`, keys, credentials, `.git/`, `.github/`,
    `.claude/`, `CLAUDE.md`, `.mcp.json`, git hooks), even if the issue asks.
    If the task truly needs one, stop and ask the user.
+   This is intentional: issues that target CI or Claude config get no file
+   hints for those paths. Matching is case-insensitive.
 
 ## Steps
 
