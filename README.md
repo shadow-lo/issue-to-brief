@@ -71,3 +71,18 @@ python3 -m unittest discover -s tests -v
 ## Format
 
 See [docs/SCHEMA.md](docs/SCHEMA.md).
+
+## Known limitations
+
+- Secret redaction is pattern-based. A bare high-entropy value with no
+  recognizable prefix or `key=` label (for example a bare AWS secret access
+  key) is not redacted, and compound names like `mypassword=` with no separator
+  or case change are missed.
+- `keys/` and `private/` directories are treated as secret locations
+  everywhere. This fails safe but hides, for example, i18n `keys/en.json`.
+- Bare multi-dot filenames in prose (`webpack.config.js` without a slash or
+  backticks) are not extracted.
+- All of `.github/` and `.claude/` are guard rails on purpose, so issues about
+  CI or Claude config get no file hints for those paths.
+- Injection detection is advisory. The real defences are that issue text never
+  becomes instructions, commands or parsed lines.

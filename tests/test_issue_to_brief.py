@@ -1188,3 +1188,16 @@ class CamelCaseSecretTests(unittest.TestCase):
         for t in ("authToken: abcdef123", "dbPassword = hunter22", "secretKey: zzzzzzzz9", "GITHUB_TOKEN=abcdefgh1"):
             out, n = itb.redact_secrets(t)
             self.assertEqual(n, 1, t)
+
+
+class ScopeSecretTests(TmpCase):
+    def test_scope_never_covers_unnamed_secrets(self):
+        make_repo(self.tmp, {"config/app.py": "x", "config/.env": "X=1", "config/secrets/a.yml": "x"})
+        b = self.brief(issue(body="Bug in config/app.py"))
+        f = b["files"]
+        self.assertEqual(f["modify"], ["config/app.py"])
+        self.assertNotIn("config/**", f["allowed_globs"])
+        self.assertIn("config/app.py", f["allowed_globs"])
+        self.assertIn("config/.env", f["must_not_touch"])
+        self.assertIn("config/secrets/", f["must_not_touch"])
+        itb.validate_brief(b)

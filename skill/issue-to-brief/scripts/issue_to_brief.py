@@ -1082,6 +1082,17 @@ def build_brief(raw_issue: dict, repo_name: str | None, repo: Repo,
     missing = missing[:MAX_PATHS]
     likely = modify + [c for c in create if c not in modify]
 
+    if repo.root is not None:
+        # Scope globs widen to a file's top-level directory; protect secrets
+        # living there too, so the scope never silently covers them.
+        tops = sorted({p.split("/")[0] + "/" for p in likely + context if "/" in p.rstrip("/")})
+        for d in tops:
+            for hidden in repo.secret_files_under(d):
+                if hidden not in must_not_touch and len(must_not_touch) < MAX_PATHS * 2:
+                    must_not_touch.append(hidden)
+                    secret_mentions.append(hidden)
+                    flags = sorted(set(flags) | {"secret_in_context_dir"})
+
     tiers = decide_tiers(title, body, labels, likely, len(criteria), flags)
     if secret_mentions:
         tiers["sensitive"] = True
